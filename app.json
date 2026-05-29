@@ -26,6 +26,13 @@
     "plugins": [
       "expo-router",
       [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "JihWolrd needs your location to set your pickup point.",
+          "locationWhenInUsePermission": "JihWolrd needs your location to set your pickup point."
+        }
+      ],
+      [
         "expo-splash-screen",
         {
           "backgroundColor": "#208AEF",
