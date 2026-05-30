@@ -602,33 +602,6 @@ function SuggestionsList({ query, activeField, onSelect, onGps }: {
   );
 }
 
-// ─── Vehicle card ─────────────────────────────────────────────────────────────
-
-function VehicleCard({ v, selected, onPress }: { v: (typeof VEHICLES)[number]; selected: boolean; onPress: () => void }) {
-  const scale = useSharedValue(1);
-  const anim  = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
-  return (
-    <Animated.View style={anim}>
-      <Pressable onPressIn={() => { scale.value = withSpring(0.92); }} onPressOut={() => { scale.value = withSpring(1); }}
-        onPress={onPress} style={[ss.vCard, selected && { borderColor: v.color, backgroundColor: `${v.color}12` }]}>
-        {/* Accent strip */}
-        <View style={[ss.vStrip, { backgroundColor: v.color }]} />
-        {/* Icon area */}
-        <View style={[ss.vIconWrap, { backgroundColor: selected ? `${v.color}22` : JIH.navyL }]}>
-          <Sym name={v.sfIcon} size={22} color={selected ? v.color : JIH.w55} />
-        </View>
-        <Text style={[ss.vLabel, selected && { color: v.color }]}>{v.label}</Text>
-        <Text style={ss.vDesc}>{v.desc}</Text>
-        <View style={ss.vPriceRow}>
-          <Text style={[ss.vPrice, selected && { color: v.color }]}>${v.baseFare.toFixed(2)}</Text>
-          <Text style={ss.vPriceUnit}>+</Text>
-        </View>
-        <Text style={ss.vSeats}>{v.maxSeats} seat{v.maxSeats > 1 ? 's' : ''}</Text>
-      </Pressable>
-    </Animated.View>
-  );
-}
-
 // ─── Payment option ───────────────────────────────────────────────────────────
 
 function PaymentOption({ p, selected, onPress }: { p: (typeof PAYMENTS)[number]; selected: boolean; onPress: () => void }) {
@@ -664,6 +637,9 @@ function RideCard({ ride, onCancel }: { ride: Booking; onCancel: (id: string) =>
 
   // ── Driver location: poll every 5 s + real-time bonus ────────────────────
   const [driverLoc, setDriverLoc] = useState<{ lat: number; lng: number } | null>(null);
+  const [driverHeading, setDriverHeading] = useState<{ bearing: number; turn: TurnDir } | null>(null);
+  const driverPrevLocRef = useRef<{ lat: number; lng: number } | null>(null);
+  const turnTimerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollDriverRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -703,6 +679,27 @@ function RideCard({ ride, onCancel }: { ride: Booking; onCancel: (id: string) =>
       supabase.removeChannel(ch);
     };
   }, [ride.driver_id, isLive]);
+
+  // ── Compute heading + turn signal when driver location changes ───────────
+  useEffect(() => {
+    if (!driverLoc) { driverPrevLocRef.current = null; return; }
+    const prev = driverPrevLocRef.current;
+    if (prev) {
+      const dist = Math.hypot(driverLoc.lat - prev.lat, driverLoc.lng - prev.lng);
+      if (dist > 0.00001) {
+        const bearing = calcBearing(prev.lat, prev.lng, driverLoc.lat, driverLoc.lng);
+        if (turnTimerRef.current) clearTimeout(turnTimerRef.current);
+        setDriverHeading(h => {
+          const turn = h ? detectTurn(h.bearing, bearing) : null;
+          return { bearing, turn };
+        });
+        turnTimerRef.current = setTimeout(() => {
+          setDriverHeading(h => h?.turn ? { ...h, turn: null } : h);
+        }, 2500);
+      }
+    }
+    driverPrevLocRef.current = { lat: driverLoc.lat, lng: driverLoc.lng };
+  }, [driverLoc]);
 
 
   return (
@@ -758,15 +755,19 @@ function RideCard({ ride, onCancel }: { ride: Booking; onCancel: (id: string) =>
                 <View style={ss.markerRed}><View style={ss.markerInner} /></View>
               </Marker>
             )}
-            {/* Driver marker — appears when driver broadcasts location */}
+            {/* Driver marker — rotates to heading, shows turn signal */}
             {driverLoc && (
               <Marker
                 coordinate={{ latitude: driverLoc.lat, longitude: driverLoc.lng }}
                 title={ride.driver_name ?? 'Your driver'}
-                tracksViewChanges={false}>
-                <View style={ss.markerDriver}>
-                  <Text style={ss.driverMarkerIcon}>🚗</Text>
-                </View>
+                anchor={{ x: 0.5, y: 0.65 }}
+                tracksViewChanges>
+                <VehicleMarkerContent
+                  vehicleType={ride.vehicle_type}
+                  color={vehicle?.color ?? '#3B82F6'}
+                  bearing={driverHeading?.bearing ?? 0}
+                  turn={driverHeading?.turn ?? null}
+                />
               </Marker>
             )}
             {/* Route polyline */}
@@ -876,10 +877,56 @@ type OnlineDriver = {
   is_online: boolean | null;
 };
 
+// ─── Bearing / turn-signal helpers ───────────────────────────────────────────
+
+type TurnDir = 'left' | 'right' | null;
+
+function calcBearing(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const toRad = (d: number) => d * Math.PI / 180;
+  const φ1 = toRad(lat1), φ2 = toRad(lat2);
+  const Δλ = toRad(lon2 - lon1);
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+}
+
+function detectTurn(prevBearing: number, nextBearing: number): TurnDir {
+  let diff = ((nextBearing - prevBearing) + 360) % 360;
+  if (diff > 180) diff -= 360;
+  if (diff < -20) return 'left';
+  if (diff > 20) return 'right';
+  return null;
+}
+
+// ─── Vehicle marker: heading arrow + optional turn signal ─────────────────────
+
+function VehicleMarkerContent({ vehicleType, color, bearing, turn }: {
+  vehicleType: string; color: string; bearing: number; turn: TurnDir;
+}) {
+  const emoji = vehicleType === 'tuktuk' ? '🛺'
+              : vehicleType === 'car'    ? '🚗'
+              : vehicleType === 'moto'   ? '🏍'
+              : '🚐';
+  return (
+    <View style={{ alignItems: 'center', gap: 1 }}>
+      {/* Triangle rotates to face direction of travel */}
+      <View style={[ss.headingArrow, { transform: [{ rotate: `${bearing}deg` }], borderBottomColor: color }]} />
+      {/* Vehicle circle + turn indicators */}
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 3 }}>
+        {turn === 'left'  && <Text style={ss.turnArrowTxt}>◀</Text>}
+        <View style={[ss.driverMarker, { backgroundColor: color }]}>
+          <Text style={ss.driverMarkerIcon}>{emoji}</Text>
+        </View>
+        {turn === 'right' && <Text style={ss.turnArrowTxt}>▶</Text>}
+      </View>
+    </View>
+  );
+}
+
 // ─── BookForm ─────────────────────────────────────────────────────────────────
 
 function BookForm({ onBooked }: { onBooked: () => void }) {
-  const [step,        setStep]        = useState<1 | 2>(1);
+  const [step,        setStep]        = useState<0 | 1 | 2>(0);
   const [mode,        setMode]        = useState<BookingMode>('standard');
   const [pickupLoc,   setPickupLoc]   = useState<LocResult | null>(null);
   const [destLoc,     setDestLoc]     = useState<LocResult | null>(null);
@@ -898,8 +945,11 @@ function BookForm({ onBooked }: { onBooked: () => void }) {
   const [gpsLoading,    setGpsLoading]    = useState(false);
   const [loading,       setLoading]       = useState(false);
   const [onlineDrivers, setOnlineDrivers] = useState<OnlineDriver[]>([]);
+  const [driverHeadings, setDriverHeadings] = useState<Record<string, { bearing: number; turn: TurnDir }>>({});
+  const driverPrevPosRef    = useRef<Record<string, { lat: number; lng: number }>>({});
+  const driverTurnTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
-  // ── Online drivers: poll every 10 s + real-time bonus layer ─────────────
+  // ── Online drivers: real-time position updates + 3 s polling fallback ───
   const pollDriversRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchOnlineDrivers = useCallback(async () => {
@@ -911,25 +961,31 @@ function BookForm({ onBooked }: { onBooked: () => void }) {
   }, []);
 
   useEffect(() => {
-    fetchOnlineDrivers(); // immediate first load
+    fetchOnlineDrivers();
 
-    // Reliable polling every 10 seconds (works even without real-time enabled)
-    pollDriversRef.current = setInterval(fetchOnlineDrivers, 10_000);
+    // Fallback poll every 3 s — keeps positions fresh when Realtime isn't enabled
+    pollDriversRef.current = setInterval(fetchOnlineDrivers, 3_000);
 
-    // Bonus: real-time for instant updates when table replication is enabled
+    const applyDriverUpdate = (d: OnlineDriver) => {
+      setOnlineDrivers(prev => {
+        const rest = prev.filter(x => x.user_id !== d.user_id);
+        if (d.is_online && d.current_lat && d.current_lng) return [...rest, d];
+        return rest;
+      });
+    };
+
+    // Real-time: covers driver movement (UPDATE) and going online (INSERT)
     const ch = supabase.channel('map-online-drivers')
       .on('postgres_changes', {
         event: 'UPDATE',
         schema: 'public',
         table: 'driver_profiles',
-      }, (payload) => {
-        const d = payload.new as OnlineDriver;
-        setOnlineDrivers(prev => {
-          const rest = prev.filter(x => x.user_id !== d.user_id);
-          if (d.is_online && d.current_lat && d.current_lng) return [...rest, d];
-          return rest; // went offline — remove immediately
-        });
-      })
+      }, payload => applyDriverUpdate(payload.new as OnlineDriver))
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'driver_profiles',
+      }, payload => applyDriverUpdate(payload.new as OnlineDriver))
       .subscribe();
 
     return () => {
@@ -937,6 +993,38 @@ function BookForm({ onBooked }: { onBooked: () => void }) {
       supabase.removeChannel(ch);
     };
   }, [fetchOnlineDrivers]);
+
+  // ── Compute heading + turn signal for each driver when positions update ───
+  useEffect(() => {
+    const bearingUpdates: Record<string, number> = {};
+    for (const d of onlineDrivers) {
+      if (!d.current_lat || !d.current_lng) continue;
+      const prev = driverPrevPosRef.current[d.user_id];
+      if (prev) {
+        const dist = Math.hypot(d.current_lat - prev.lat, d.current_lng - prev.lng);
+        if (dist > 0.00001) {
+          bearingUpdates[d.user_id] = calcBearing(prev.lat, prev.lng, d.current_lat, d.current_lng);
+        }
+      }
+      driverPrevPosRef.current[d.user_id] = { lat: d.current_lat, lng: d.current_lng };
+    }
+    if (!Object.keys(bearingUpdates).length) return;
+    setDriverHeadings(prev => {
+      const next = { ...prev };
+      for (const [uid, bearing] of Object.entries(bearingUpdates)) {
+        const turn = prev[uid] ? detectTurn(prev[uid].bearing, bearing) : null;
+        next[uid] = { bearing, turn };
+      }
+      return next;
+    });
+    for (const uid of Object.keys(bearingUpdates)) {
+      if (driverTurnTimersRef.current[uid]) clearTimeout(driverTurnTimersRef.current[uid]);
+      driverTurnTimersRef.current[uid] = setTimeout(() => {
+        setDriverHeadings(h => h[uid]?.turn ? { ...h, [uid]: { ...h[uid], turn: null } } : h);
+      }, 2500);
+    }
+  }, [onlineDrivers]);
+
   const mapRef  = useRef<MapView>(null);
   const presets = makePresets();
   const selV    = VEHICLES.find(v => v.type === vehicle)!;
@@ -1005,6 +1093,7 @@ function BookForm({ onBooked }: { onBooked: () => void }) {
       });
       setPickupText(''); setDestText(''); setPickupLoc(null); setDestLoc(null);
       setHireDesc(''); setOfferedFare(''); setSchedPreset('');
+      setStep(0);
       Alert.alert(
         mode === 'full_day' ? 'Full Day Requested' : mode === 'scheduled' ? 'Ride Scheduled' : 'Ride Requested',
         mode === 'full_day' ? 'Your full-day offer has been submitted to drivers.' :
@@ -1028,8 +1117,12 @@ function BookForm({ onBooked }: { onBooked: () => void }) {
   };
 
   const handleBack = () => {
-    setStep(1);
-    mapH.value = MAP_H1;
+    if (step === 2) {
+      setStep(1);
+      mapH.value = MAP_H1;
+    } else {
+      setStep(0);
+    }
   };
 
   // ── Shared map block ─────────────────────────────────────────────────────
@@ -1066,6 +1159,50 @@ function BookForm({ onBooked }: { onBooked: () => void }) {
   );
 
   // ══════════════════════════════════════════════════════════════════════════
+  // STEP 0 — Vehicle picker
+  // ══════════════════════════════════════════════════════════════════════════
+  if (step === 0) {
+    return (
+      <View style={{ flex: 1, backgroundColor: JIH.navy }}>
+        <View style={[ss.vpHeader, { paddingTop: formInsets.top + Spacing.two }]}>
+          <Text style={ss.vpCity}>Siem Reap</Text>
+          <Text style={ss.vpTitle}>Book a ride</Text>
+        </View>
+        <ScrollView contentContainerStyle={ss.vpList} showsVerticalScrollIndicator={false}>
+          {VEHICLES.map(v => {
+            const emoji = v.type === 'tuktuk' ? '🛺'
+                        : v.type === 'car'    ? '🚗'
+                        : v.type === 'van'    ? '🚐'
+                        : '🏍';
+            return (
+              <Pressable
+                key={v.type}
+                onPress={() => { setVehicle(v.type); setStep(1); mapH.value = MAP_H1; }}
+                style={({ pressed }) => [ss.vpRow, { opacity: pressed ? 0.8 : 1 }]}>
+                <View style={[ss.vpStrip, { backgroundColor: v.color }]} />
+                <View style={[ss.vpIconBox, { backgroundColor: `${v.color}18` }]}>
+                  <Text style={ss.vpEmoji}>{emoji}</Text>
+                </View>
+                <View style={ss.vpInfo}>
+                  <Text style={ss.vpName}>{v.label}</Text>
+                  <Text style={ss.vpMeta}>
+                    {v.maxSeats === 1 ? '1 seat' : `up to ${v.maxSeats} seats`}
+                    {' · '}{v.desc}
+                  </Text>
+                </View>
+                <View style={ss.vpRight}>
+                  <Text style={[ss.vpPrice, { color: v.color }]}>${v.baseFare.toFixed(2)}</Text>
+                  <Text style={ss.vpPerKm}>${v.perKm}/km</Text>
+                </View>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      </View>
+    );
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // STEP 1 — Location entry (full-screen map + floating panel)
   // ══════════════════════════════════════════════════════════════════════════
   if (step === 1) {
@@ -1085,23 +1222,21 @@ function BookForm({ onBooked }: { onBooked: () => void }) {
             showsScale={false}>
 
             {/* Online driver markers — NO SymbolView inside Marker (causes iOS freeze) */}
-            {onlineDrivers.map(driver => {
-              const v = VEHICLES.find(x => x.type === driver.vehicle_type);
-              // Emoji in plain <Text> is safe inside Markers; SymbolView is not
-              const icon = v?.type === 'tuktuk' ? '🛺'
-                         : v?.type === 'car'    ? '🚗'
-                         : v?.type === 'moto'   ? '🏍'
-                         : '🚐';
+            {onlineDrivers.filter(d => d.vehicle_type === vehicle).map(driver => {
+              const v       = VEHICLES.find(x => x.type === driver.vehicle_type);
+              const heading = driverHeadings[driver.user_id];
               return (
                 <Marker
                   key={driver.user_id}
                   coordinate={{ latitude: driver.current_lat!, longitude: driver.current_lng! }}
                   title={`${v?.label ?? 'Driver'} available`}
-                  tracksViewChanges={false}
-                  anchor={{ x: 0.5, y: 0.5 }}>
-                  <View style={[ss.driverMarker, { backgroundColor: v?.color ?? JIH.navyM }]}>
-                    <Text style={ss.driverMarkerIcon}>{icon}</Text>
-                  </View>
+                  anchor={{ x: 0.5, y: 0.65 }}>
+                  <VehicleMarkerContent
+                    vehicleType={driver.vehicle_type ?? 'car'}
+                    color={v?.color ?? JIH.navyM}
+                    bearing={heading?.bearing ?? 0}
+                    turn={heading?.turn ?? null}
+                  />
                 </Marker>
               );
             })}
@@ -1148,6 +1283,13 @@ function BookForm({ onBooked }: { onBooked: () => void }) {
               </View>
             </View>
           )}
+
+          {/* Back button — step 1 */}
+          <Pressable
+            onPress={handleBack}
+            style={[ss.mapBackBtn, { top: formInsets.top + Spacing.two }]}>
+            <Sym name="chevron.left" size={16} color={JIH.white} />
+          </Pressable>
         </View>
 
         {/* ── Floating bottom panel ── */}
@@ -1229,8 +1371,8 @@ function BookForm({ onBooked }: { onBooked: () => void }) {
           </View>
         </View>
         <View style={ss.routeSummaryEdit}>
-          <Sym name="pencil.circle" size={18} color={JIH.gold} />
-          <Text style={ss.routeSummaryEditTxt}>Edit</Text>
+          <Sym name="chevron.left.circle.fill" size={18} color={JIH.gold} />
+          <Text style={ss.routeSummaryEditTxt}>Back</Text>
         </View>
       </Pressable>
 
@@ -1277,15 +1419,6 @@ function BookForm({ onBooked }: { onBooked: () => void }) {
             </View>
           </>
         )}
-
-        {/* Vehicle */}
-        <Text style={ss.sectionLbl}>Ride type</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={ss.vScroll}>
-          {VEHICLES.map(v => (
-            <VehicleCard key={v.type} v={v} selected={vehicle === v.type}
-              onPress={() => { setVehicle(v.type); if (groupSize > v.maxSeats) setGroupSize(1); }} />
-          ))}
-        </ScrollView>
 
         {/* Group size */}
         {vehicle !== 'moto' && (
@@ -1788,4 +1921,55 @@ const ss = StyleSheet.create({
   stateTxt:   { color: JIH.w55, fontSize: 14, textAlign: 'center', paddingHorizontal: Spacing.four },
   retryBtn:   { backgroundColor: JIH.gold, paddingHorizontal: Spacing.four, paddingVertical: 10, borderRadius: 12, marginTop: 4 },
   retryTxt:   { color: JIH.navy, fontWeight: '700', fontSize: 14 },
+
+  // ── Step 0: vehicle picker ──────────────────────────────────────────────
+  vehiclePickerHeader: { paddingHorizontal: Spacing.four, paddingBottom: Spacing.three, gap: 4 },
+  vehiclePickerTitle:  { color: JIH.white, fontSize: 26, fontWeight: '700', letterSpacing: -0.5 },
+  vehiclePickerSub:    { color: JIH.w55, fontSize: 14 },
+  vehiclePickerGrid:   { flex: 1, flexDirection: 'row', flexWrap: 'wrap', padding: Spacing.two, gap: Spacing.two },
+  vehiclePickerCard:   {
+    width: '48%', flex: 0, backgroundColor: JIH.navyM, borderRadius: 16,
+    overflow: 'hidden', padding: Spacing.three, gap: 4,
+    borderWidth: 1, borderColor: JIH.w10,
+  },
+  vehiclePickerStrip:  { position: 'absolute', top: 0, left: 0, right: 0, height: 4 },
+  vehiclePickerEmoji:  { fontSize: 36, marginTop: Spacing.two },
+  vehiclePickerLabel:  { fontSize: 18, fontWeight: '700', marginTop: 4 },
+  vehiclePickerDesc:   { color: JIH.w55, fontSize: 12 },
+  vehiclePickerPrice:  { color: JIH.gold, fontSize: 13, fontWeight: '600', marginTop: 4 },
+
+  // ── Floating back button (step 1 map overlay) ───────────────────────────
+  mapBackBtn: {
+    position: 'absolute', left: Spacing.three, zIndex: 10,
+    width: 38, height: 38, borderRadius: 19,
+    backgroundColor: JIH.navyM,
+    alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1, borderColor: JIH.w15,
+  },
+
+  // ── Vehicle picker list (step 0) ─────────────────────────────────────────
+  vpHeader:  { paddingHorizontal: Spacing.four, paddingBottom: Spacing.three, gap: 2 },
+  vpCity:    { color: JIH.gold, fontSize: 11, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 1.5 },
+  vpTitle:   { color: JIH.white, fontSize: 28, fontWeight: '800', letterSpacing: -0.8 },
+  vpList:    { paddingHorizontal: Spacing.three, gap: Spacing.two, paddingBottom: Spacing.four },
+  vpRow:     { flexDirection: 'row', alignItems: 'center', backgroundColor: JIH.navyM, borderRadius: 14, overflow: 'hidden', borderWidth: 1, borderColor: JIH.w10 },
+  vpStrip:   { width: 4, alignSelf: 'stretch' },
+  vpIconBox: { width: 52, height: 52, alignItems: 'center', justifyContent: 'center', marginLeft: 12 },
+  vpEmoji:   { fontSize: 26 },
+  vpInfo:    { flex: 1, paddingVertical: 16, paddingLeft: 12, gap: 2 },
+  vpName:    { color: JIH.white, fontSize: 16, fontWeight: '700', letterSpacing: -0.2 },
+  vpMeta:    { color: JIH.w30, fontSize: 12 },
+  vpRight:   { paddingRight: 16, alignItems: 'flex-end', gap: 1 },
+  vpPrice:   { fontSize: 16, fontWeight: '700' },
+  vpPerKm:   { color: JIH.w30, fontSize: 11 },
+
+  // ── Vehicle marker: heading arrow + turn signals ─────────────────────────
+  headingArrow: {
+    width: 0, height: 0,
+    borderLeftWidth: 6, borderRightWidth: 6, borderBottomWidth: 9,
+    borderStyle: 'solid',
+    borderLeftColor: 'transparent', borderRightColor: 'transparent',
+    // borderBottomColor is set inline to match the vehicle color
+  },
+  turnArrowTxt: { fontSize: 13, color: '#F59E0B', fontWeight: '800', lineHeight: 14 },
 });
